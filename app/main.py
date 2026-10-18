@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app import config, database
 from app.models import Base
-from app.routers import auth, health
+from app.routers import auth, health, me
 
 _VALUE_ERROR_PREFIX = "Value error, "
 
@@ -31,6 +31,7 @@ app.add_middleware(
 
 app.include_router(health.router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1")
+app.include_router(me.router, prefix="/api/v1")
 
 
 async def validation_exception_handler(

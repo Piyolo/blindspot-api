@@ -49,6 +49,30 @@ async def client(db_engine, monkeypatch):
         yield test_client
 
 
+@pytest.fixture
+async def auth_headers(client):
+    """Bearer headers for a freshly signed-up user (Task 4's ``auth_headers``).
+
+    Signs the user up through the real signup route, so the token is a real
+    HS256 token for a real row. ``client`` points the app engine at the test
+    engine, and the autouse ``_reset_limiters`` fixture keeps the shared IP's
+    signup quota clean, so every test may sign up once. JWT signing needs
+    ``JWT_SECRET`` — each module that uses this fixture sets it via its own
+    autouse ``jwt_secret`` fixture (same pattern as ``test_auth.py``).
+    """
+    response = await client.post(
+        "/api/v1/auth/signup",
+        json={
+            "name": "Maria Santos",
+            "email": "maria@example.com",
+            "password": "password123",
+            "contact_number": "0917 123 4567",
+        },
+    )
+    assert response.status_code == 201
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
 @pytest.fixture(autouse=True)
 def _reset_limiters():
     """Clear both in-memory failure limiters before every test.
