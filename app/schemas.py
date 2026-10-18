@@ -26,13 +26,16 @@ def is_valid_password(raw: str) -> bool:
 def normalize_contact_number(raw: str) -> str:
     """Strip formatting, keep a leading ``+``, and validate 7-15 digits.
 
+    ASCII-only by contract (parity with the client's rule): a leading ``+``
+    is kept, only ASCII digits ``[0-9]`` count, everything else is stripped —
+    so Unicode digits (fullwidth, Arabic-Indic, ...) never satisfy the rule.
     Returns the canonical form (digits, or ``+`` followed by digits).
     Raises ``ValueError`` (surfaced to clients as a 400 ``detail`` string)
     when the number holds fewer than 7 or more than 15 digits.
     """
     text = raw.strip()
     has_plus = text.startswith("+")
-    digits = re.sub(r"\D", "", text)
+    digits = re.sub(r"[^0-9]", "", text)
     if not 7 <= len(digits) <= 15:
         raise ValueError(CONTACT_NUMBER_ERROR)
     return f"+{digits}" if has_plus else digits
@@ -76,6 +79,13 @@ class SignupRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr = Field(max_length=254)
     password: str
+
+    @field_validator("email")
+    @classmethod
+    def lower_email(cls, value: str) -> str:
+        # email-validator keeps the local part's case; lowercase so the
+        # stored canonical form and Task 3's lookup always agree.
+        return value.lower()
 
 
 class UserOut(BaseModel):
