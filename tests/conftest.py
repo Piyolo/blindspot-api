@@ -13,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.main import app
 from app.models import Base
+from app.rate_limit import login_limiter, signup_limiter
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
@@ -38,7 +39,23 @@ async def db_session(db_engine):
 
 
 @pytest.fixture
-async def client(db_engine):  # db_engine: schema exists on the test engine
+async def client(db_engine, monkeypatch):
+    # db_engine: schema exists on the test engine. Route sessions come from
+    # app.deps.get_db -> database.get_engine, so point the app engine at the
+    # test engine and both share the same in-memory SQLite database.
+    monkeypatch.setattr("app.database.get_engine", lambda: db_engine)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as test_client:
         yield test_client
+
+
+@pytest.fixture(autouse=True)
+def _reset_limiters():
+    """Clear both in-memory failure limiters before every test.
+
+    Every test shares one client IP, and later fixtures (Task 4's
+    ``auth_headers``) sign up repeatedly — without this reset, unrelated
+    tests would trip the 429s.
+    """
+    login_limiter.reset()
+    signup_limiter.reset()
