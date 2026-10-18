@@ -125,6 +125,34 @@ async def test_signup_stable_cf_connecting_ip_gets_its_own_bucket(client):
     assert r.json()["detail"] == "Too many attempts. Try again later."
 
 
+async def test_signup_limit_holds_when_true_client_ip_rotates_but_cf_connecting_ip_is_stable(
+    client,
+):
+    # Precedence must hold at the ROUTE level too: Cloudflare strips/blocks a
+    # caller-supplied CF-Connecting-IP at its edge (403), while a caller-
+    # supplied True-Client-IP does reach the app. So an attacker who sends
+    # both headers and rotates True-Client-IP must still land in the one
+    # CF-Connecting-IP bucket — 5 fills trip the limit and the 6th request
+    # 429s even though its True-Client-IP differs from every fill.
+    for i in range(5):
+        r = await client.post(
+            SIGNUP,
+            json=_signup_payload(email=f"prec{i}@example.com"),
+            headers={
+                "CF-Connecting-IP": "203.0.113.9",
+                "True-Client-IP": f"198.51.100.{i + 1}",
+            },
+        )
+        assert r.status_code == 201
+    r = await client.post(
+        SIGNUP,
+        json=_signup_payload(email="prec5@example.com"),
+        headers={"CF-Connecting-IP": "203.0.113.9", "True-Client-IP": "198.51.100.6"},
+    )
+    assert r.status_code == 429
+    assert r.json()["detail"] == "Too many attempts. Try again later."
+
+
 async def test_signup_rotating_cf_connecting_ip_gets_fresh_buckets(client):
     # CF-Connecting-IP is Cloudflare-controlled in production — Cloudflare
     # overwrites whatever the caller sent, so callers cannot rotate it
@@ -365,6 +393,21 @@ def test_client_ip_prefers_cf_connecting_ip_and_ignores_spoofed_xff():
         headers={
             "CF-Connecting-IP": "203.0.113.9",
             "X-Forwarded-For": "8.8.8.8, 1.1.1.1",
+        }
+    )
+    assert client_ip(request) == "203.0.113.9"
+
+
+def test_client_ip_prefers_cf_connecting_ip_over_true_client_ip():
+    # Both headers present with DIFFERENT valid addresses: CF-Connecting-IP
+    # must win. Cloudflare strips/blocks a caller-supplied CF-Connecting-IP
+    # (403 at the edge) but forwards a caller-supplied True-Client-IP, so a
+    # swapped lookup order would let a caller pick their own limiter key and
+    # mint fresh buckets.
+    request = _request(
+        headers={
+            "CF-Connecting-IP": "203.0.113.9",
+            "True-Client-IP": "198.51.100.7",
         }
     )
     assert client_ip(request) == "203.0.113.9"
