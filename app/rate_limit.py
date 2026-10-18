@@ -56,8 +56,17 @@ signup_limiter = FailureLimiter(limit=5, window_seconds=3600)
 
 
 def client_ip(request: Request) -> str:
-    """Best-effort client IP: the first ``X-Forwarded-For`` entry, else the socket peer."""
+    """Best-effort client IP for rate-limit keying.
+
+    The LAST ``X-Forwarded-For`` entry wins: each trusted proxy appends the
+    peer address it actually saw, so the rightmost entry is proxy-attested
+    while anything to its left arrived from the client and is spoofable.
+    Falls back to the socket peer, then to ``"unknown"`` — never raises,
+    not even when ``request.client`` is ``None``.
+    """
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host
+        return forwarded.split(",")[-1].strip()
+    if request.client is not None:
+        return request.client.host
+    return "unknown"

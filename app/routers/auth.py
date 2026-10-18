@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.deps import get_db
@@ -17,6 +18,15 @@ EMAIL_TAKEN_DETAIL = "This email is already registered. Try logging in."
 LOGIN_FAILED_DETAIL = "Invalid email or password."
 
 
+async def _find_user_id_by_email(db: AsyncSession, email: str) -> int | None:
+    """Duplicate pre-check: the id of the row holding ``email``, else None.
+
+    Module-level so tests can patch it to reproduce the concurrent-signup
+    race (pre-check passes, INSERT then hits the UNIQUE constraint).
+    """
+    return await db.scalar(select(User.id).where(User.email == email))
+
+
 @router.post("/auth/signup", status_code=201, response_model=TokenResponse)
 async def signup(
     payload: SignupRequest,
@@ -27,13 +37,14 @@ async def signup(
 
     Emails are stored and compared lowercased (``SignupRequest``'s
     validator), so the duplicate check is case-insensitive. Every allowed
-    attempt counts against ``signup_limiter`` (5 per IP per hour).
+    attempt counts against ``signup_limiter`` (5 per IP per hour). The
+    insert also catches the UNIQUE race a pre-check cannot see.
     """
     ip = client_ip(request)
     if not signup_limiter.allowed(ip):
         raise HTTPException(status_code=429, detail=RATE_LIMIT_DETAIL)
     signup_limiter.record(ip)
-    existing = await db.scalar(select(User.id).where(User.email == payload.email))
+    existing = await _find_user_id_by_email(db, payload.email)
     if existing is not None:
         raise HTTPException(status_code=409, detail=EMAIL_TAKEN_DETAIL)
     user = User(
@@ -43,7 +54,13 @@ async def signup(
         contact_number=payload.contact_number,
     )
     db.add(user)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Lost the race: another request committed this email between our
+        # pre-check and our INSERT. Same outcome as a seen duplicate.
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=EMAIL_TAKEN_DETAIL)
     return TokenResponse(
         access_token=create_access_token(user.id),
         user=UserOut.model_validate(user),

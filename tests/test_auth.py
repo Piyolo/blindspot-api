@@ -10,8 +10,10 @@ No password value is ever printed.
 import pytest
 from fastapi import HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import text
 
-from app.deps import get_current_user
+from app.deps import get_current_user, get_db
+from app.models import User
 from app.rate_limit import FailureLimiter, client_ip, login_limiter, signup_limiter
 from app.security import create_access_token, decode_access_token
 
@@ -85,6 +87,31 @@ async def test_signup_invalid_body_is_400_with_string_detail(client):
     assert isinstance(r.json()["detail"], str)
 
 
+async def test_signup_lost_race_is_409_not_500(client, db_session, monkeypatch):
+    # Reproduce the concurrent-duplicate race deterministically: request A
+    # has already committed the row, and request B's duplicate pre-check
+    # SELECT ran before that commit — so B's check misses and its INSERT
+    # collides with the UNIQUE constraint.
+    db_session.add(
+        User(
+            name="Race Winner",
+            email="maria@example.com",
+            password_hash="unusable-hash",
+            contact_number="09171234567",
+        )
+    )
+    await db_session.commit()
+
+    async def pre_check_misses(db, email):
+        return None
+
+    monkeypatch.setattr("app.routers.auth._find_user_id_by_email", pre_check_misses)
+
+    r = await client.post(SIGNUP, json=_signup_payload())
+    assert r.status_code == 409
+    assert r.json()["detail"] == "This email is already registered. Try logging in."
+
+
 # --- POST /auth/login ----------------------------------------------------
 
 
@@ -139,11 +166,20 @@ async def test_login_success_resets_limiter(client):
         LOGIN, json={"email": "maria@example.com", "password": "password123"}
     )
     assert ok.status_code == 200
-    # counter was reset: the next failure is a plain 401, not a 429
+    # The success must have reset the bucket: a full fresh quota of 10
+    # failures is allowed before the limiter trips again. (Without the
+    # reset the bucket still holds 9 hits, so the 2nd failure below — the
+    # 11th overall — would 429.)
+    for _ in range(10):
+        r = await client.post(
+            LOGIN, json={"email": "maria@example.com", "password": "wrong-pass-1"}
+        )
+        assert r.status_code == 401
     r = await client.post(
         LOGIN, json={"email": "maria@example.com", "password": "wrong-pass-1"}
     )
-    assert r.status_code == 401
+    assert r.status_code == 429
+    assert r.json()["detail"] == "Too many attempts. Try again later."
 
 
 # --- app.deps.get_current_user -------------------------------------------
@@ -220,15 +256,45 @@ def _request(headers=None, client_host="127.0.0.1"):
     return Request(scope)
 
 
-def test_client_ip_prefers_first_x_forwarded_for_entry():
-    request = _request(headers={"X-Forwarded-For": "203.0.113.7, 10.0.0.1"})
+def test_client_ip_uses_last_x_forwarded_for_entry():
+    # The leftmost entries are client-supplied (spoofable); the rightmost
+    # is the address the nearest trusted proxy actually saw.
+    request = _request(
+        headers={"X-Forwarded-For": "203.0.113.9, 198.51.100.7, 192.0.2.5"}
+    )
+    assert client_ip(request) == "192.0.2.5"
+
+
+def test_client_ip_single_forwarded_entry():
+    request = _request(headers={"X-Forwarded-For": "203.0.113.7"})
     assert client_ip(request) == "203.0.113.7"
 
 
-def test_client_ip_trims_forwarded_entry():
-    request = _request(headers={"X-Forwarded-For": "  203.0.113.7 ,10.0.0.1"})
-    assert client_ip(request) == "203.0.113.7"
+def test_client_ip_trims_forwarded_entries():
+    request = _request(headers={"X-Forwarded-For": "  203.0.113.7 ,  192.0.2.5  "})
+    assert client_ip(request) == "192.0.2.5"
 
 
 def test_client_ip_falls_back_to_client_host():
     assert client_ip(_request()) == "127.0.0.1"
+
+
+def test_client_ip_is_unknown_when_no_client_and_no_header():
+    scope = {"type": "http", "headers": []}  # no "client" key -> request.client is None
+    assert client_ip(Request(scope)) == "unknown"
+
+
+# --- app.deps.get_db ------------------------------------------------------
+
+
+async def test_get_db_closes_session_when_body_raises(db_engine, monkeypatch):
+    monkeypatch.setattr("app.database.get_engine", lambda: db_engine)
+    agen = get_db()
+    session = await agen.__anext__()  # advance to the yield
+    await session.execute(text("SELECT 1"))  # autobegins a transaction
+    assert session.in_transaction() is True
+    with pytest.raises(RuntimeError, match="boom"):
+        await agen.athrow(RuntimeError("boom"))  # simulate a failing request
+    # The finally clause must have closed the session, ending its
+    # transaction (an unclosed session would still be in_transaction).
+    assert session.in_transaction() is False
