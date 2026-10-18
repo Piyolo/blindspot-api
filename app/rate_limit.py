@@ -5,6 +5,7 @@ single-worker deployment; no Redis, no new dependencies. Time comes from the
 injectable ``now`` argument in tests, so nothing ever sleeps.
 """
 
+import ipaddress
 import time
 from collections import deque
 
@@ -55,18 +56,35 @@ login_limiter = FailureLimiter(limit=10, window_seconds=600)
 signup_limiter = FailureLimiter(limit=5, window_seconds=3600)
 
 
+# Why no X-Forwarded-For position is ever used as a key: every Render service
+# sits behind Cloudflare, which APPENDS to X-Forwarded-For — so the leftmost
+# entry is caller-controlled and the remaining hops are rotating Cloudflare/
+# Render edge addresses, which scattered consecutive requests across buckets
+# and silently disabled the limiter in production. ``CF-Connecting-IP`` is the
+# header Cloudflare *overwrites* (Render documents it as the trustworthy one),
+# with ``True-Client-IP`` as a validated secondary. ``request.client.host`` is
+# only reached in local/dev/test, and on Render it would be the internal load
+# balancer's address anyway because uvicorn does not trust the proxy.
+
+
 def client_ip(request: Request) -> str:
     """Best-effort client IP for rate-limit keying.
 
-    The LAST ``X-Forwarded-For`` entry wins: each trusted proxy appends the
-    peer address it actually saw, so the rightmost entry is proxy-attested
-    while anything to its left arrived from the client and is spoofable.
-    Falls back to the socket peer, then to ``"unknown"`` — never raises,
-    not even when ``request.client`` is ``None``.
+    Resolution order: ``CF-Connecting-IP``, then ``True-Client-IP`` (each only
+    when the trimmed value parses as an IPv4/IPv6 address), then the socket
+    peer, then ``"unknown"`` — never raises, not even when ``request.client``
+    is ``None``. Never derived from ``X-Forwarded-For`` in any position.
     """
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[-1].strip()
-    if request.client is not None:
+    for header in ("CF-Connecting-IP", "True-Client-IP"):
+        raw = request.headers.get(header)
+        if raw is None:
+            continue
+        candidate = raw.strip()
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            continue  # junk/unparseable: fall through, never key on it
+        return candidate
+    if request.client is not None and request.client.host:
         return request.client.host
     return "unknown"

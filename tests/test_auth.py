@@ -79,6 +79,67 @@ async def test_signup_rate_limited_after_5_per_hour(client):
     assert r.json()["detail"] == "Too many attempts. Try again later."
 
 
+async def test_signup_rate_limit_ignores_rotating_x_forwarded_for(client):
+    # Live regression (Render behind Cloudflare): the edge APPENDS to
+    # X-Forwarded-For, so a caller who omits CF-Connecting-IP and rotates
+    # XFF on every request must still share ONE bucket. Keying on any XFF
+    # position spread these across buckets and the deployed 6th signup
+    # returned 201 instead of 429.
+    for i in range(5):
+        r = await client.post(
+            SIGNUP,
+            json=_signup_payload(email=f"rot{i}@example.com"),
+            headers={"X-Forwarded-For": f"203.0.113.{i + 1}"},
+        )
+        assert r.status_code == 201
+    r = await client.post(
+        SIGNUP,
+        json=_signup_payload(email="rot5@example.com"),
+        headers={"X-Forwarded-For": "203.0.113.6"},
+    )
+    assert r.status_code == 429
+    assert r.json()["detail"] == "Too many attempts. Try again later."
+
+
+async def test_signup_stable_cf_connecting_ip_gets_its_own_bucket(client):
+    # A stable CF-Connecting-IP fills and trips its own bucket even while
+    # XFF rotates on every request; it shares nothing with a no-CF caller,
+    # whose key is the test client's socket host (each test starts from a
+    # freshly reset limiter).
+    for i in range(5):
+        r = await client.post(
+            SIGNUP,
+            json=_signup_payload(email=f"cf{i}@example.com"),
+            headers={
+                "CF-Connecting-IP": "203.0.113.9",
+                "X-Forwarded-For": f"198.51.100.{i + 1}",
+            },
+        )
+        assert r.status_code == 201
+    r = await client.post(
+        SIGNUP,
+        json=_signup_payload(email="cf5@example.com"),
+        headers={"CF-Connecting-IP": "203.0.113.9", "X-Forwarded-For": "198.51.100.6"},
+    )
+    assert r.status_code == 429
+    assert r.json()["detail"] == "Too many attempts. Try again later."
+
+
+async def test_signup_rotating_cf_connecting_ip_gets_fresh_buckets(client):
+    # CF-Connecting-IP is Cloudflare-controlled in production — Cloudflare
+    # overwrites whatever the caller sent, so callers cannot rotate it
+    # there. In this in-process test the header is caller-controlled, so
+    # rotating it mints a fresh bucket per request: the expected behaviour
+    # of the agreed contract, not a production bypass.
+    for i in range(10):
+        r = await client.post(
+            SIGNUP,
+            json=_signup_payload(email=f"fresh{i}@example.com"),
+            headers={"CF-Connecting-IP": f"203.0.113.{i + 1}"},
+        )
+        assert r.status_code == 201
+
+
 async def test_signup_invalid_body_is_400_with_string_detail(client):
     # End-to-end counterpart of Task 1's handler unit test: a missing field
     # reaches the app-level handler and comes back as a string detail.
@@ -153,6 +214,45 @@ async def test_login_rate_limited_after_10_failures(client):
     )
     assert r.status_code == 429
     assert r.json()["detail"] == "Too many attempts. Try again later."
+
+
+async def test_login_rate_limit_ignores_rotating_x_forwarded_for(client):
+    # Same live regression on the login path: rotating XFF while omitting
+    # CF-Connecting-IP must still share ONE bucket, so the 11th consecutive
+    # failure trips 429 (deployed it returned 401).
+    for i in range(10):
+        r = await client.post(
+            LOGIN,
+            json={"email": "ghost@example.com", "password": "nope12345"},
+            headers={"X-Forwarded-For": f"203.0.113.{i + 1}"},
+        )
+        assert r.status_code == 401
+    r = await client.post(
+        LOGIN,
+        json={"email": "ghost@example.com", "password": "nope12345"},
+        headers={"X-Forwarded-For": "203.0.113.11"},
+    )
+    assert r.status_code == 429
+    assert r.json()["detail"] == "Too many attempts. Try again later."
+
+
+async def test_login_stable_cf_connecting_ip_is_its_own_bucket(client):
+    # 5 failures from a caller with no CF header, then 6 from a caller with
+    # a stable CF-Connecting-IP: neither trips (limit is 10), but under a
+    # shared bucket the 11th request would be over the limit and 429.
+    for _ in range(5):
+        r = await client.post(
+            LOGIN,
+            json={"email": "ghost@example.com", "password": "nope12345"},
+        )
+        assert r.status_code == 401
+    for _ in range(6):
+        r = await client.post(
+            LOGIN,
+            json={"email": "ghost@example.com", "password": "nope12345"},
+            headers={"CF-Connecting-IP": "203.0.113.9"},
+        )
+        assert r.status_code == 401
 
 
 async def test_login_success_resets_limiter(client):
@@ -244,44 +344,90 @@ def test_failure_limiter_prunes_hits_older_than_window():
     assert limiter.allowed("ip", now=1602.0) is False
 
 
-def _request(headers=None, client_host="127.0.0.1"):
+def _request(headers=None, *, client_host="127.0.0.1"):
     scope = {
         "type": "http",
         "headers": [
             (name.lower().encode(), value.encode())
             for name, value in (headers or {}).items()
         ],
-        "client": (client_host, 12345),
     }
+    if client_host is not None:
+        scope["client"] = (client_host, 12345)
     return Request(scope)
 
 
-def test_client_ip_uses_last_x_forwarded_for_entry():
-    # The leftmost entries are client-supplied (spoofable); the rightmost
-    # is the address the nearest trusted proxy actually saw.
+def test_client_ip_prefers_cf_connecting_ip_and_ignores_spoofed_xff():
+    # Regression for the live defect: Cloudflare APPENDS to X-Forwarded-For,
+    # so the leftmost entry is caller-controlled and the rest are rotating
+    # edge hops. A caller-supplied XFF must never influence the key.
     request = _request(
-        headers={"X-Forwarded-For": "203.0.113.9, 198.51.100.7, 192.0.2.5"}
+        headers={
+            "CF-Connecting-IP": "203.0.113.9",
+            "X-Forwarded-For": "8.8.8.8, 1.1.1.1",
+        }
     )
-    assert client_ip(request) == "192.0.2.5"
+    assert client_ip(request) == "203.0.113.9"
 
 
-def test_client_ip_single_forwarded_entry():
-    request = _request(headers={"X-Forwarded-For": "203.0.113.7"})
-    assert client_ip(request) == "203.0.113.7"
+def test_client_ip_falls_back_to_true_client_ip():
+    request = _request(headers={"True-Client-IP": "198.51.100.7"})
+    assert client_ip(request) == "198.51.100.7"
 
 
-def test_client_ip_trims_forwarded_entries():
-    request = _request(headers={"X-Forwarded-For": "  203.0.113.7 ,  192.0.2.5  "})
-    assert client_ip(request) == "192.0.2.5"
+def test_client_ip_never_keys_on_x_forwarded_for_alone():
+    # A lone, perfectly valid-looking XFF entry must be ignored entirely —
+    # no XFF position may ever be used as a rate-limit key.
+    request = _request(headers={"X-Forwarded-For": "203.0.113.9"})
+    assert client_ip(request) == "127.0.0.1"
 
 
 def test_client_ip_falls_back_to_client_host():
     assert client_ip(_request()) == "127.0.0.1"
 
 
-def test_client_ip_is_unknown_when_no_client_and_no_header():
-    scope = {"type": "http", "headers": []}  # no "client" key -> request.client is None
-    assert client_ip(Request(scope)) == "unknown"
+def test_client_ip_is_unknown_when_no_client_and_no_headers():
+    request = _request(client_host=None)  # scope has no "client" key
+    assert client_ip(request) == "unknown"
+
+
+def test_client_ip_is_unknown_when_client_host_is_empty():
+    assert client_ip(_request(client_host="")) == "unknown"
+
+
+def test_client_ip_trims_cf_connecting_ip():
+    request = _request(headers={"CF-Connecting-IP": " 203.0.113.9 "})
+    assert client_ip(request) == "203.0.113.9"
+
+
+def test_client_ip_trims_true_client_ip():
+    request = _request(headers={"True-Client-IP": "  198.51.100.7  "})
+    assert client_ip(request) == "198.51.100.7"
+
+
+@pytest.mark.parametrize(
+    "junk",
+    ["not-an-ip", "999.999.999.999", "  ", ""],
+    ids=["not-an-ip", "out-of-range-octets", "blank", "empty"],
+)
+def test_client_ip_never_returns_junk_cf_connecting_ip(junk):
+    # The junk value must never become the key: fall through to the socket
+    # peer instead.
+    assert client_ip(_request(headers={"CF-Connecting-IP": junk})) == "127.0.0.1"
+
+
+def test_client_ip_junk_cf_falls_through_to_valid_true_client_ip():
+    request = _request(
+        headers={"CF-Connecting-IP": "not-an-ip", "True-Client-IP": "198.51.100.7"}
+    )
+    assert client_ip(request) == "198.51.100.7"
+
+
+def test_client_ip_junk_cf_and_junk_true_client_ip_fall_back_to_client_host():
+    request = _request(
+        headers={"CF-Connecting-IP": "999.999.999.999", "True-Client-IP": "nope"}
+    )
+    assert client_ip(request) == "127.0.0.1"
 
 
 # --- app.deps.get_db ------------------------------------------------------
