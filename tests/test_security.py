@@ -113,3 +113,91 @@ def test_non_int_sub_raises_invalid_token(bad_sub):
     )
     with pytest.raises(InvalidTokenError):
         decode_access_token(token)
+
+
+# --- Fix round 1 (findings F1-F4, F6) -------------------------------------
+
+
+def test_token_is_bound_to_env_secret(monkeypatch):
+    # F1: the secret must come from the environment on *both* encode and
+    # decode — a hard-coded secret would make this decode succeed.
+    token = create_access_token(user_id=7)
+    monkeypatch.setenv("JWT_SECRET", "rotated-secret")
+    with pytest.raises(InvalidTokenError):
+        decode_access_token(token)
+
+
+def test_hs512_with_matching_secret_rejected():
+    # F2: pins algorithms=[ALGORITHM] — same secret, correct signature,
+    # wrong algorithm must still be rejected. Passes only if the allowlist
+    # stays HS256-only; widening it to "HS512" must fail this test.
+    now = int(time.time())
+    token = jwt.encode(
+        {"sub": "1", "iat": now, "exp": now + 60},
+        get_jwt_secret(),
+        algorithm="HS512",
+    )
+    with pytest.raises(InvalidTokenError):
+        decode_access_token(token)
+
+
+@pytest.mark.parametrize("good_sub", ["1", "42", "999999999999999999999"])
+def test_canonical_sub_accepted(good_sub):
+    # F3: ^[1-9][0-9]*$ decodes to the integer user id.
+    now = int(time.time())
+    token = jwt.encode(
+        {"sub": good_sub, "iat": now, "exp": now + 60},
+        get_jwt_secret(),
+        algorithm="HS256",
+    )
+    assert decode_access_token(token) == int(good_sub)
+
+
+_MISSING = object()  # sentinel: payload without a "sub" claim at all
+
+
+@pytest.mark.parametrize(
+    "bad_sub",
+    ["0", "007", " 12 ", "+5", "-5", "1_0", "abc", "", "12\n", _MISSING],
+)
+def test_non_canonical_sub_rejected(bad_sub):
+    # F3: no sign, no leading zero, no whitespace, no underscores, no
+    # empty/non-string — only ^[1-9][0-9]*$ and a present claim.
+    now = int(time.time())
+    payload = {"iat": now, "exp": now + 60}
+    if bad_sub is not _MISSING:
+        payload["sub"] = bad_sub
+    token = jwt.encode(payload, get_jwt_secret(), algorithm="HS256")
+    with pytest.raises(InvalidTokenError):
+        decode_access_token(token)
+
+
+def test_json_integer_sub_rejected():
+    # F5 evidence for the report claim: PyJWT 2.15.1 verify_sub defaults to
+    # True, so a JSON-integer sub never reaches this module's code — callers
+    # still only ever see InvalidTokenError.
+    now = int(time.time())
+    token = jwt.encode(
+        {"sub": 123, "iat": now, "exp": now + 60},
+        get_jwt_secret(),
+        algorithm="HS256",
+    )
+    with pytest.raises(InvalidTokenError):
+        decode_access_token(token)
+
+
+@pytest.mark.parametrize("bad_hash", [None, "", 123, b"bytes"])
+def test_verify_password_non_string_or_empty_hash_returns_false(bad_hash):
+    # F4: the docstring promises False (never an exception) for any bad hash.
+    assert verify_password("x", bad_hash) is False
+
+
+@pytest.mark.parametrize("missing", ["exp", "iat"])
+def test_token_missing_required_claim_rejected(missing):
+    # F6: exp, iat and sub are required at decode time.
+    now = int(time.time())
+    payload = {"sub": "1", "iat": now, "exp": now + 60}
+    del payload[missing]
+    token = jwt.encode(payload, get_jwt_secret(), algorithm="HS256")
+    with pytest.raises(InvalidTokenError):
+        decode_access_token(token)

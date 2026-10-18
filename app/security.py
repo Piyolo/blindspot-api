@@ -1,11 +1,12 @@
 """argon2 password hashing and HS256 JWT access-token helpers.
 
 Pure functions — no routes, no database access. Every access-token failure
-mode (expired, tampered, malformed, wrong algorithm, missing/non-integer
-``sub``) surfaces as :class:`InvalidTokenError`; PyJWT's internal exception
-types never leak to callers.
+mode (expired, tampered, malformed, wrong algorithm, missing or
+non-canonical ``sub``) surfaces as :class:`InvalidTokenError`; PyJWT's
+internal exception types never leak to callers.
 """
 
+import re
 import time
 
 import jwt
@@ -15,6 +16,10 @@ from argon2.exceptions import Argon2Error
 from app.config import ACCESS_TTL_SECONDS, get_jwt_secret
 
 ALGORITHM = "HS256"
+
+# Ratified sub rule: a decimal string with no sign, leading zero,
+# whitespace or underscores ("1", "42", "999999999999999999999").
+_CANONICAL_SUB = re.compile(r"[1-9][0-9]*")
 
 # argon2id with argon2-cffi's defaults (lead ruling: no new dependencies).
 _hasher = PasswordHasher()
@@ -32,9 +37,11 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, password_hash: str) -> bool:
     """Return True iff ``password`` matches ``password_hash``.
 
-    Wrong password, corrupted hash, and unsupported hash parameters all
-    return False rather than raising.
+    Wrong password, a non-string or empty hash, a corrupted hash, and
+    unsupported hash parameters all return False rather than raising.
     """
+    if not isinstance(password_hash, str) or not password_hash:
+        return False
     try:
         return _hasher.verify(password_hash, password)
     except (Argon2Error, ValueError):
@@ -53,21 +60,31 @@ def create_access_token(user_id: int, ttl_seconds: int = ACCESS_TTL_SECONDS) -> 
 def decode_access_token(token: str) -> int:
     """Return the integer user id for ``token`` or raise InvalidTokenError."""
     try:
-        payload = jwt.decode(token, get_jwt_secret(), algorithms=[ALGORITHM])
+        payload = jwt.decode(
+            token,
+            get_jwt_secret(),
+            algorithms=[ALGORITHM],
+            options={"require": ["exp", "iat", "sub"]},
+        )
     except jwt.PyJWTError as exc:
         # ExpiredSignatureError, InvalidSignatureError, DecodeError,
-        # InvalidAlgorithmError, ... — all wrapped, none leak.
+        # InvalidAlgorithmError, MissingRequiredClaimError, ... — all
+        # wrapped, none leak.
         raise InvalidTokenError("Invalid or expired access token") from exc
     return _user_id_from_payload(payload)
 
 
 def _user_id_from_payload(payload: dict) -> int:
+    # PyJWT 2.15.1's verify_sub (default on) guarantees "sub" is present
+    # and a string by the time it reaches us; the canonical-form rule below
+    # is ours: ^[1-9][0-9]*$ — no sign, leading zero, whitespace or
+    # underscores (fullmatch, so not even a trailing newline slips through).
     sub = payload.get("sub")
-    if isinstance(sub, str):
-        try:
-            return int(sub)
-        except ValueError as exc:
-            raise InvalidTokenError("Invalid or expired access token") from exc
-    if isinstance(sub, int) and not isinstance(sub, bool):
-        return sub
-    raise InvalidTokenError("Invalid or expired access token")
+    if not isinstance(sub, str) or _CANONICAL_SUB.fullmatch(sub) is None:
+        raise InvalidTokenError("Invalid or expired access token")
+    try:
+        return int(sub)
+    except ValueError as exc:
+        # Only reachable for absurdly long digit strings under runtimes
+        # with the int-to-str digit limit (Python 3.11+).
+        raise InvalidTokenError("Invalid or expired access token") from exc
