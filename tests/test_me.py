@@ -91,6 +91,17 @@ async def test_put_me_partial_update_leaves_other_fields_alone(client, auth_head
     assert r.json()["user"]["contact_number"] == "09171234567"
 
 
+async def test_put_me_trims_name_whitespace(client, auth_headers):
+    # UpdateMeRequest's before-validator strips surrounding whitespace; the
+    # trimmed value must be what is stored and returned, not just echoed.
+    r = await client.put(ME, headers=auth_headers, json={"name": "  Ana  "})
+    assert r.status_code == 200
+    assert r.json()["user"]["name"] == "Ana"
+    # a fresh GET proves the trimmed value was persisted
+    r = await client.get(ME, headers=auth_headers)
+    assert r.json()["user"]["name"] == "Ana"
+
+
 async def test_put_me_rejects_bad_contact(client, auth_headers):
     r = await client.put(ME, headers=auth_headers, json={"contact_number": "12"})
     assert r.status_code == 400
@@ -102,6 +113,131 @@ async def test_put_me_without_token_is_401(client):
     r = await client.put(ME, json={"contact_number": "09171234567"})
     assert r.status_code == 401
     assert r.json()["detail"] == INVALID_TOKEN_DETAIL
+
+
+# --- PUT /me: multi-user isolation ----------------------------------------
+
+
+async def _read_user_row(db_session, email):
+    """Fresh-from-DB snapshot of one user row (identity map expired first).
+
+    Without ``expire_all`` (synchronous on ``AsyncSession``) the session
+    would hand back the cached instance, so a change committed by another
+    session's request would be invisible.
+    """
+    db_session.expire_all()
+    user = await db_session.scalar(select(User).where(User.email == email))
+    assert user is not None
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "password_hash": user.password_hash,
+        "contact_number": user.contact_number,
+        "created_at": user.created_at,
+    }
+
+
+async def test_put_me_only_affects_the_authenticated_user(
+    client, auth_headers, db_session
+):
+    # user B signs up alongside user A (from auth_headers)
+    r = await client.post(
+        SIGNUP,
+        json={
+            "name": "Bruno Cruz",
+            "email": "bruno@example.com",
+            "password": "password123",
+            "contact_number": "0918 111 2222",
+        },
+    )
+    assert r.status_code == 201
+    b_id = r.json()["user"]["id"]
+    before_b = await _read_user_row(db_session, "bruno@example.com")
+
+    # A updates their own profile; payload keys that try to address B
+    # (id, user_id, email) are ignored — there is no parameter that can
+    # target another user's row.
+    r = await client.put(
+        ME,
+        headers=auth_headers,
+        json={
+            "name": "Ana Reyes",
+            "id": b_id,
+            "user_id": b_id,
+            "email": "bruno@example.com",
+        },
+    )
+    assert r.status_code == 200
+    updated = r.json()["user"]
+    assert updated["name"] == "Ana Reyes"
+    assert updated["email"] == "maria@example.com"  # A's own email, untouched
+    assert updated["id"] != b_id  # still A's row
+
+    # A's GET returns only A
+    r = await client.get(ME, headers=auth_headers)
+    me = r.json()["user"]
+    assert me["email"] == "maria@example.com"
+    assert me["name"] == "Ana Reyes"
+
+    # B's row is byte-identical before and after (fresh read)
+    after_b = await _read_user_row(db_session, "bruno@example.com")
+    assert after_b == before_b
+
+
+async def test_put_me_ignores_email_and_unknown_keys(client, auth_headers):
+    # email is deliberately not updatable via /me; unknown keys are ignored
+    r = await client.put(
+        ME,
+        headers=auth_headers,
+        json={
+            "email": "maria@newdomain.com",
+            "contact_number": "09171234567",
+            "some_unknown_key": 42,
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["user"]["email"] == SIGNUP_EMAIL
+    # stored, not just filtered from the response
+    r = await client.get(ME, headers=auth_headers)
+    assert r.json()["user"]["email"] == SIGNUP_EMAIL
+
+
+# --- PUT /me: boundaries --------------------------------------------------
+
+
+async def test_put_me_empty_body_is_noop(client, auth_headers):
+    before = (await client.get(ME, headers=auth_headers)).json()["user"]
+    r = await client.put(ME, headers=auth_headers, json={})
+    assert r.status_code == 200
+    assert r.json()["user"] == before
+    after = (await client.get(ME, headers=auth_headers)).json()["user"]
+    assert after == before
+
+
+async def test_put_me_rejects_empty_contact_number(client, auth_headers):
+    r = await client.put(ME, headers=auth_headers, json={"contact_number": ""})
+    assert r.status_code == 400
+    assert r.json()["detail"] == CONTACT_NUMBER_ERROR
+
+
+async def test_put_me_rejects_16_digit_contact_number(client, auth_headers):
+    r = await client.put(
+        ME, headers=auth_headers, json={"contact_number": "0917123456789012"}
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"] == CONTACT_NUMBER_ERROR
+
+
+async def test_put_me_name_length_boundaries(client, auth_headers):
+    # 1 character is the accepted minimum
+    r = await client.put(ME, headers=auth_headers, json={"name": "A"})
+    assert r.status_code == 200
+    assert r.json()["user"]["name"] == "A"
+    # 81 characters exceed the 80-char cap → 400 with a string detail
+    r = await client.put(ME, headers=auth_headers, json={"name": "B" * 81})
+    assert r.status_code == 400
+    assert r.json()["detail"] == "String should have at most 80 characters"
 
 
 # --- PUT /me/password -----------------------------------------------------
